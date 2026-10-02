@@ -56,16 +56,64 @@ export function decodeGooglePolyline(encoded) {
 }
 
 /**
- * Deduplicates routes that are effectively the same road path (>95% overlap)
+ * Detects whether a route enters a dead-end, private residential compound,
+ * or cul-de-sac and doubles back out onto the same road junction.
+ */
+function hasDeadEndLoop(path) {
+  if (!path || path.length < 8) return false;
+  const step = 2;
+  for (let i = 0; i < path.length - 6; i += step) {
+    const p1 = path[i];
+    for (let j = i + 5; j < Math.min(i + 35, path.length); j += step) {
+      const p2 = path[j];
+      const directMeters = haversineDistance(p1.lat, p1.lng, p2.lat, p2.lng) * 1000;
+      // If the direct distance between entry and exit is small (< 50m) but the vehicle traveled > 150m between them,
+      // the route entered an internal dead-end / gated complex and doubled back out!
+      if (directMeters < 50) {
+        let pathMeters = 0;
+        for (let k = i; k < j; k++) {
+          pathMeters += haversineDistance(path[k].lat, path[k].lng, path[k + 1].lat, path[k + 1].lng) * 1000;
+        }
+        if (pathMeters > 150) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Deduplicates routes and discards dead-end loops or excessively long detours
  */
 function deduplicateRoutes(routes) {
+  if (!routes || routes.length === 0) return [];
+
+  // Filter out any route that performs unnatural dead-end loops into gated compounds or gardens
+  const validRoutes = routes.filter(r => {
+    if (!r.path || r.path.length < 2) return false;
+    if (hasDeadEndLoop(r.path)) {
+      return false;
+    }
+    return true;
+  });
+
+  const baseRoutes = validRoutes.length > 0 ? validRoutes : routes;
+  const shortestKm = Math.min(...baseRoutes.map(r => r.distanceKm || 999));
+
   const unique = [];
-  for (const r of routes) {
+  for (const r of baseRoutes) {
     if (!r.path || r.path.length < 2) continue;
+
+    // Discard detours that are more than 1.4x the shortest route
+    if (shortestKm > 0 && r.distanceKm > shortestKm * 1.4) {
+      continue;
+    }
+
     const isDuplicate = unique.some(existing => {
       const distDiff = Math.abs(existing.distanceKm - r.distanceKm);
       const durDiff = Math.abs(existing.durationMin - r.durationMin);
-      if (distDiff < 0.2 && durDiff < 0.4) {
+      if (distDiff < 0.25 && durDiff < 0.5) {
         const midIdxA = Math.floor(existing.path.length / 2);
         const midIdxB = Math.floor(r.path.length / 2);
         const midDist = haversineDistance(
@@ -78,6 +126,7 @@ function deduplicateRoutes(routes) {
       }
       return false;
     });
+
     if (!isDuplicate) {
       unique.push(r);
     }
@@ -190,16 +239,44 @@ export class SafeRouteEngine {
   }
 
   /**
-   * Queries real road network from OSRM driving/foot engine for a set of coordinate waypoints
+   * Snaps a coordinate to the nearest recognized public road.
+   * Rejects unnamed alleys or distant points to prevent routing into gated societies or gardens.
    */
-  async queryRealRoadPath(waypoints) {
+  async snapToNearestRoad(lat, lng) {
+    const profile = this.getRoutingProfile();
+    const url = `https://router.project-osrm.org/nearest/v1/${profile}/${lng},${lat}?number=1`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        const data = await res.json();
+        const wp = data.waypoints?.[0];
+        if (wp && wp.location && wp.distance < 350 && wp.name && wp.name.trim().length > 1) {
+          return {
+            lat: Number(wp.location[1].toFixed(6)),
+            lng: Number(wp.location[0].toFixed(6)),
+            name: wp.name
+          };
+        }
+      }
+    } catch (e) {
+      console.warn("Snap to nearest road error:", e.message);
+    }
+    return null;
+  }
+
+  /**
+   * Queries real road network from OSRM driving/foot engine for a set of coordinate waypoints.
+   * Uses alternatives=3 for direct routes to fetch natural arterial road paths.
+   */
+  async queryRealRoadPath(waypoints, allowAlternatives = true) {
     if (!waypoints || waypoints.length < 2) return null;
     const coordStr = waypoints.map(w => `${w.lng},${w.lat}`).join(';');
     const profile = this.getRoutingProfile();
-    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${coordStr}?overview=full&geometries=geojson&alternatives=true`;
+    const altParam = (allowAlternatives && waypoints.length === 2) ? 'alternatives=3' : 'alternatives=false';
+    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${coordStr}?overview=full&geometries=geojson&${altParam}`;
     
     try {
-      const res = await fetch(osrmUrl);
+      const res = await fetch(osrmUrl, { signal: AbortSignal.timeout(6000) });
       if (res.ok) {
         const json = await res.json();
         if (json.routes && json.routes.length > 0) {
@@ -214,7 +291,7 @@ export class SafeRouteEngine {
         }
       }
     } catch (e) {
-      console.warn("Real road query error:", e);
+      console.warn("Real road query error:", e.message);
     }
     return null;
   }
@@ -259,8 +336,8 @@ export class SafeRouteEngine {
       }
     }
 
-    // 2. Fetch direct authoritative OSRM driving routes with alternatives=true
-    const directResults = await this.queryRealRoadPath([o, d]);
+    // 2. Fetch direct authoritative OSRM driving routes with up to 3 alternatives
+    const directResults = await this.queryRealRoadPath([o, d], true);
     if (directResults && directResults.length > 0) {
       directResults.forEach((r, idx) => {
         rawCandidates.push({
@@ -275,8 +352,8 @@ export class SafeRouteEngine {
     }
 
     // 3. DYNAMIC SAFE DETOUR DISCOVERY:
-    // Check if any reported unsafe hotspots lie near the direct paths.
-    // If so, explore genuine road network detours through legitimate arterial bypass waypoints.
+    // Only search for manual bypasses if we have fewer than 2 genuine corridors or an active High/Critical danger hotspot.
+    // Detour waypoints are strictly snapped to recognized public roads to avoid entering apartments or private gardens.
     const allReports = reportStore.getAllReports();
     const midLat = (o.lat + d.lat) / 2;
     const midLng = (o.lng + d.lng) / 2;
@@ -284,48 +361,57 @@ export class SafeRouteEngine {
 
     const hasDangerHotspot = allReports.some(rep => {
       const dMid = haversineDistance(midLat, midLng, rep.latitude, rep.longitude);
-      return dMid <= (directDistKm * 0.6);
+      return dMid <= (directDistKm * 0.5) && (rep.severity === 'Critical' || rep.severity === 'High');
     });
 
-    if (rawCandidates.length < 3 || hasDangerHotspot) {
+    if (rawCandidates.length < 2 || hasDangerHotspot) {
       const dLat = d.lat - o.lat;
       const dLng = d.lng - o.lng;
       const mag = Math.sqrt(dLat * dLat + dLng * dLng) || 1;
       const perpLat = -dLng / mag;
       const perpLng = dLat / mag;
-      const offsetScale = Math.max(0.015, Math.min(0.05, directDistKm * 0.004));
+      const offsetScale = Math.max(0.015, Math.min(0.04, directDistKm * 0.0035));
 
-      const bypassPointA = {
+      const rawA = {
         lat: Number((midLat + perpLat * offsetScale).toFixed(6)),
         lng: Number((midLng + perpLng * offsetScale).toFixed(6))
       };
-      const bypassPointB = {
+      const rawB = {
         lat: Number((midLat - perpLat * offsetScale).toFixed(6)),
         lng: Number((midLng - perpLng * offsetScale).toFixed(6))
       };
 
-      const detourPathsA = await this.queryRealRoadPath([o, bypassPointA, d]);
-      if (detourPathsA && detourPathsA[0] && detourPathsA[0].path.length > 2) {
-        rawCandidates.push({
-          id: `osrm_detour_a`,
-          name: "Safe Arterial Bypass Corridor",
-          distanceKm: detourPathsA[0].distanceKm,
-          durationMin: detourPathsA[0].durationMin,
-          path: detourPathsA[0].path,
-          provider: "OSRM Real Road Network (Detour Corridor)"
-        });
+      const [snappedA, snappedB] = await Promise.all([
+        this.snapToNearestRoad(rawA.lat, rawA.lng),
+        this.snapToNearestRoad(rawB.lat, rawB.lng)
+      ]);
+
+      if (snappedA) {
+        const detourPathsA = await this.queryRealRoadPath([o, snappedA, d], false);
+        if (detourPathsA && detourPathsA[0] && detourPathsA[0].path.length > 2 && !hasDeadEndLoop(detourPathsA[0].path)) {
+          rawCandidates.push({
+            id: `osrm_detour_a`,
+            name: `Bypass via ${snappedA.name}`,
+            distanceKm: detourPathsA[0].distanceKm,
+            durationMin: detourPathsA[0].durationMin,
+            path: detourPathsA[0].path,
+            provider: "OSRM Real Road Network (Detour Corridor)"
+          });
+        }
       }
 
-      const detourPathsB = await this.queryRealRoadPath([o, bypassPointB, d]);
-      if (detourPathsB && detourPathsB[0] && detourPathsB[0].path.length > 2) {
-        rawCandidates.push({
-          id: `osrm_detour_b`,
-          name: "Commercial Ring Road Bypass",
-          distanceKm: detourPathsB[0].distanceKm,
-          durationMin: detourPathsB[0].durationMin,
-          path: detourPathsB[0].path,
-          provider: "OSRM Real Road Network (Detour Corridor)"
-        });
+      if (snappedB) {
+        const detourPathsB = await this.queryRealRoadPath([o, snappedB, d], false);
+        if (detourPathsB && detourPathsB[0] && detourPathsB[0].path.length > 2 && !hasDeadEndLoop(detourPathsB[0].path)) {
+          rawCandidates.push({
+            id: `osrm_detour_b`,
+            name: `Bypass via ${snappedB.name}`,
+            distanceKm: detourPathsB[0].distanceKm,
+            durationMin: detourPathsB[0].durationMin,
+            path: detourPathsB[0].path,
+            provider: "OSRM Real Road Network (Detour Corridor)"
+          });
+        }
       }
     }
 
