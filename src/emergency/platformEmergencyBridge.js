@@ -122,13 +122,13 @@ export class PlatformEmergencyBridge {
       });
 
       if (res && res.success) {
-        return { success: true, status: COMM_STATUS.SENT, label: 'Sent (Cloud Alert)', deliveredCount: res.deliveredCount };
+        return { success: true, status: COMM_STATUS.SENT, label: 'Sent (Cloud Alert)', deliveredCount: res.deliveredCount, results: res.results };
       } else {
-        return { success: false, status: COMM_STATUS.FAILED, error: 'Alert delivery failed.' };
+        return { success: false, status: COMM_STATUS.FAILED, error: res?.error || 'Alert delivery failed.', results: res?.results };
       }
     } catch (err) {
       console.warn('Auto alert dispatch error:', err);
-      return { success: false, status: COMM_STATUS.FAILED, error: err.message };
+      return { success: false, status: COMM_STATUS.FAILED, error: err.message, results: [] };
     }
   }
 

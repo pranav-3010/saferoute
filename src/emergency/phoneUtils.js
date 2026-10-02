@@ -6,22 +6,22 @@ export function normalizePhoneNumber(phone) {
   let digits = str.replace(/[^0-9]/g, '');
   if (!digits) return '';
 
-  // Deduplicate redundant 91 prefixes (e.g. 91916300863028 -> 916300863028)
+  // Deduplicate redundant 91 prefixes (e.g. 91919876543210 -> 919876543210)
   while (digits.startsWith('9191') && digits.length > 12) {
     digits = digits.slice(2);
   }
 
-  // 12-digit Indian number starting with 91 (e.g. 916300863028)
+  // 12-digit Indian number starting with 91 (e.g. 919876543210)
   if (digits.length === 12 && digits.startsWith('91')) {
     return `+${digits}`;
   }
 
-  // 10-digit Indian standard number (e.g. 6300863028)
+  // 10-digit Indian standard number (e.g. 9876543210)
   if (digits.length === 10) {
     return `+91${digits}`;
   }
 
-  // 11-digit number starting with 0 (e.g. 06300863028)
+  // 11-digit number starting with 0 (e.g. 09876543210)
   if (digits.length === 11 && digits.startsWith('0')) {
     return `+91${digits.slice(1)}`;
   }

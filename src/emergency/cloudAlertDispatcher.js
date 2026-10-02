@@ -1,7 +1,8 @@
 // SafeRoute: Backend Cloud Alert & Notification Dispatcher Service
-// Dispatches automated emergency alerts with verified User/System Number
+// Dispatches emergency alerts exclusively via the authenticated /api/sos/alert server endpoint
 
 import { normalizePhoneNumber } from './phoneUtils.js';
+import { getOrRegisterDeviceToken } from './deviceTokenClient.js';
 
 export class CloudAlertDispatcher {
   constructor() {
@@ -9,7 +10,8 @@ export class CloudAlertDispatcher {
   }
 
   async dispatchEmergencyAlert({ sessionId, location, contacts, timestamp, liveTrackingUrl, userPhone }) {
-    const normSystemNumber = normalizePhoneNumber(userPhone || '+91 User');
+    const normSystemNumber = normalizePhoneNumber(userPhone || '');
+
     const recipients = (contacts || []).map(c => {
       const normPhone = normalizePhoneNumber(c.phone || c.contactNumber || '');
       return {
@@ -21,102 +23,76 @@ export class CloudAlertDispatcher {
       };
     }).filter(c => c.phone);
 
-    const primaryContact = recipients.find(r => r.isPrimary) || recipients[0] || null;
-    const gmapsUrl = location && location.latitude && location.longitude
-      ? `https://www.google.com/maps?q=${location.latitude},${location.longitude}`
-      : (liveTrackingUrl || 'Location tracking active');
-
-    const message = `🚨 EMERGENCY ALERT\n\nSOS has been activated.\n\nUser/System Number:\n${normSystemNumber}\n\nI may need help.\n\n📍 Current location:\n${gmapsUrl}\n\nPlease contact me immediately.`;
-
     const payload = {
       sessionId,
-      location: location ? {
+      location: (location && typeof location.latitude === 'number' && typeof location.longitude === 'number') ? {
         latitude: location.latitude,
         longitude: location.longitude,
-        accuracy: location.accuracy,
-        timestamp: location.timestamp
+        accuracy: location.accuracy || null,
+        timestamp: location.timestamp || null
       } : null,
-      liveTrackingUrl,
-      userPhone: normSystemNumber,
-      systemNumber: normSystemNumber,
-      googleMapsUrl: gmapsUrl,
-      message,
+      liveTrackingUrl: liveTrackingUrl || null,
+      userPhone: normSystemNumber || null,
       timestamp: timestamp || new Date().toISOString(),
-      recipients
+      contacts: recipients
     };
 
     try {
-      const n8nEndpoints = [
-        'https://pranav3010.app.n8n.cloud/webhook/sos-trigger',
-        'https://pranav3010.app.n8n.cloud/webhook/648a0c62-0d6f-4b2c-a3a6-facae7f317cf'
-      ];
-      
-      n8nEndpoints.forEach(endpoint => {
-        const payloadStr = JSON.stringify({
-          user: normSystemNumber,
-          userMobile: normSystemNumber,
-          systemNumber: normSystemNumber,
-          primaryContactPhone: primaryContact ? primaryContact.phone : '+916300863028',
-          primaryContactName: primaryContact ? primaryContact.name : 'Emergency Contact',
-          allRecipients: recipients,
-          lat: location ? location.latitude : 17.4435,
-          lng: location ? location.longitude : 78.3772,
-          googleMapsUrl: gmapsUrl,
-          message,
-          timestamp: timestamp || new Date().toLocaleTimeString(),
-          liveTrackingUrl: liveTrackingUrl || 'https://saferoute-tawny.vercel.app/'
-        });
-
-        // 1. Standard CORS POST
-        fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: payloadStr
-        }).catch(err => console.log('n8n standard dispatch note:', err));
-
-        // 2. Fail-proof Beacon / No-CORS Dispatch (bypasses browser CORS restrictions completely)
-        try {
-          if (navigator && navigator.sendBeacon) {
-            const blob = new Blob([payloadStr], { type: 'application/json' });
-            navigator.sendBeacon(endpoint, blob);
-          }
-        } catch (bErr) {
-          console.log('sendBeacon fallback:', bErr);
-        }
-      });
+      const deviceToken = await getOrRegisterDeviceToken();
 
       const response = await fetch(this.apiEndpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        headers: {
+          'Content-Type': 'application/json',
+          ...(deviceToken ? { 'X-Device-Token': deviceToken } : {})
+        },
+        body: JSON.stringify({
+          ...payload,
+          deviceToken: deviceToken || undefined
+        }),
+        signal: AbortSignal.timeout(10000)
       });
 
-      if (response.ok) {
-        const data = await response.json();
+      const data = await response.json().catch(() => ({}));
+
+      if (response.ok && data.success) {
         return {
           success: true,
           status: 'SENT',
-          deliveredCount: data.deliveredCount || payload.recipients.length,
-          results: data.results || payload.recipients.map(r => ({ id: r.id, status: 'SENT' }))
+          deliveredCount: data.deliveredCount || 0,
+          results: Array.isArray(data.results) ? data.results : recipients.map(r => ({ id: r.id, phone: r.phone, status: 'SENT' })),
+          messageBody: data.messageBody
         };
       }
+
+      // Honest failure handling when server returns 4xx, 5xx, or provider rejection
+      return {
+        success: false,
+        status: 'FAILED',
+        deliveredCount: data.deliveredCount || 0,
+        error: data.error || `Server responded with status ${response.status}`,
+        results: Array.isArray(data.results) ? data.results : recipients.map(r => ({
+          id: r.id,
+          phone: r.phone,
+          status: 'FAILED',
+          error: data.error || 'Server dispatch error'
+        }))
+      };
     } catch (netErr) {
-      console.info('Cloud alert API connection simulated:', netErr.message);
+      console.warn('Emergency alert network error:', netErr.message);
+      return {
+        success: false,
+        status: 'FAILED',
+        deliveredCount: 0,
+        error: netErr.message || 'Network connection failed during SOS dispatch',
+        results: recipients.map(r => ({
+          id: r.id,
+          phone: r.phone,
+          status: 'FAILED',
+          error: 'Network connection failed'
+        }))
+      };
     }
-
-    await new Promise(res => setTimeout(res, 350));
-
-    return {
-      success: true,
-      status: 'SENT',
-      deliveredCount: payload.recipients.length,
-      results: payload.recipients.map(r => ({
-        id: r.id,
-        phone: r.phone,
-        status: 'SENT',
-        timestamp: new Date().toISOString()
-      }))
-    };
   }
 }
 

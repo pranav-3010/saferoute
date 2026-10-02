@@ -384,18 +384,15 @@ export class EmergencySosService {
       statusPhase: 'INITIALIZING'
     });
 
-    // 1. DISPATCH EMERGENCY ALERT TO N8N & TWILIO IMMEDIATELY WITH ZERO DELAY
-    const fallbackLiveUrl = 'https://saferoute-tawny.vercel.app/';
-    this.autoDispatchEmergencyAlert(fallbackLiveUrl);
-
-    // 2. Obtain Real GPS Fix in background
-    const initialCoords = await this.fetchCurrentLocation();
-
-    // 3. Initialize Secure SOS Live Session
-    this.activeLiveSession = liveSosSessionStore.createSession(initialCoords, this.triggerSource);
+    // 1. Initialize Secure SOS Live Session FIRST (no GPS fix needed yet)
+    this.activeLiveSession = liveSosSessionStore.createSession(null, this.triggerSource);
     const liveTrackingUrl = liveSosSessionStore.getLiveTrackingUrl(this.activeLiveSession.id);
 
-    // 4. Log event into user's isolated SOS history
+    // 2. Dispatch Emergency Alert Immediately with Live Tracking URL
+    // If GPS is not yet acquired, location is sent as null (never fake coordinates)
+    await this.autoDispatchEmergencyAlert(liveTrackingUrl);
+
+    // 3. Log event into user's isolated SOS history
     const user = authService?.getAuthenticatedUser();
     const systemNumber = user?.systemNumber || user?.mobileNumber || user?.phone || 'usr_default';
     userStore.logSosEvent(systemNumber, {
@@ -403,14 +400,25 @@ export class EmergencySosService {
       systemNumber,
       triggerSource: this.triggerSource,
       timestamp: this.sosTimestamp,
-      location: initialCoords,
+      location: this.currentLocation,
       contactsNotified: this.contacts.map(c => ({ name: c.name, phone: c.phone })),
       status: 'ACTIVE'
     });
 
-    // 5. Start Continuous GPS Tracking & Persistent Foreground Service
+    // 4. Start Continuous GPS Tracking & Persistent Foreground Service
     this.startLiveLocationTracking();
     platformEmergencyBridge.startForegroundService(this.activeLiveSession.id);
+
+    // 5. Fetch Initial GPS Location Asynchronously (Send follow-up if fix arrives)
+    this.fetchCurrentLocation().then(initialCoords => {
+      if (initialCoords && this.state === SOS_STATUS.ACTIVE && this.activeLiveSession) {
+        this.currentLocation = initialCoords;
+        liveSosSessionStore.appendLiveCoordinate(this.activeLiveSession.id, initialCoords);
+        this.onLocationUpdate(this.currentLocation, null);
+        // Dispatch location follow-up once GPS fix is acquired
+        this.autoDispatchEmergencyAlert(liveTrackingUrl);
+      }
+    });
 
     // 6. Automatically Initiate Primary Phone Call
     if (primary && primary.phone) {
@@ -430,10 +438,6 @@ export class EmergencySosService {
 
   async activateSOS(source = this.triggerSource) {
     return this.activateNativeSOS(source);
-  }
-
-  executeSosNow(source = this.triggerSource) {
-    this.startSosCountdown(source);
   }
 
   async fetchCurrentLocation() {
@@ -518,12 +522,29 @@ export class EmergencySosService {
       userPhone: systemNumber
     });
 
-    if (res && res.success) {
-      this.contacts.forEach(c => c.messageStatus = 'Sent');
+    if (res && res.results && Array.isArray(res.results) && res.results.length > 0) {
+      this.contacts.forEach(c => {
+        const item = res.results.find(r => r.id === c.id || r.phone === c.phone);
+        if (item) {
+          c.messageStatus = item.status === 'SENT' ? 'Sent' : 'Failed';
+          c.dispatchError = item.error || null;
+        } else {
+          c.messageStatus = res.success ? 'Sent' : 'Failed';
+        }
+      });
+    } else if (res && res.success) {
+      this.contacts.forEach(c => {
+        c.messageStatus = 'Sent';
+        c.dispatchError = null;
+      });
     } else {
-      this.contacts.forEach(c => c.messageStatus = 'Failed');
+      this.contacts.forEach(c => {
+        c.messageStatus = 'Failed';
+        c.dispatchError = res?.error || 'Alert dispatch failed';
+      });
     }
     this.onContactsChange(this.contacts);
+    return res;
   }
 
   async autoInitiatePrimaryCall(primary) {
