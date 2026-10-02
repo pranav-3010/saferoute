@@ -529,15 +529,18 @@ function renderSosActiveContacts(contacts) {
     const card = document.createElement('div');
     card.className = `sos-contact-item-card ${c.isPrimary ? 'primary' : ''}`;
 
-    const isCallActive = c.callStatus.includes('Progress') || c.callStatus.includes('Started');
+    const isCallActive = c.callStatus.includes('Progress') || c.callStatus.includes('Started') || c.callStatus === 'Calling';
     const isCallFailed = c.callStatus.includes('Failed');
     const callText = isCallActive ? 'In Progress' : (isCallFailed ? 'Failed' : (c.isPrimary ? 'Preparing' : 'Standby'));
     const callBadgeClass = isCallActive ? 'good' : (isCallFailed ? 'danger' : 'dim');
 
     const isMsgSent = c.messageStatus === 'Sent';
     const isMsgFailed = c.messageStatus === 'Failed';
-    const msgText = isMsgSent ? 'Sent' : (isMsgFailed ? 'Failed' : 'Sending...');
+    const msgText = isMsgSent ? 'Sent' : (isMsgFailed ? 'Failed' : (c.messageStatus === 'Sending' ? 'Sending...' : 'Standby'));
     const msgBadgeClass = isMsgSent ? 'good' : (isMsgFailed ? 'danger' : 'dim');
+
+    const liveUrl = (inputLiveUrlDisplay && inputLiveUrlDisplay.value) ? inputLiveUrlDisplay.value : window.location.origin;
+    const smsText = encodeURIComponent(`EMERGENCY: SafeRoute SOS activated. Tracking link: ${liveUrl}`);
 
     card.innerHTML = `
       <div class="sos-contact-info">
@@ -551,6 +554,11 @@ function renderSosActiveContacts(contacts) {
           <span>Call: <strong class="status-text ${callBadgeClass}">${callText}</strong></span>
           <span>·</span>
           <span>Emergency Alert: <strong class="status-text ${msgBadgeClass}">${msgText}</strong></span>
+        </div>
+        ${isMsgFailed ? `<div class="dispatch-error-notice">⚠️ Delivery failed${c.dispatchError ? ': ' + c.dispatchError : ''} — Use direct call/SMS below</div>` : ''}
+        <div class="contact-fallback-actions">
+          <a href="tel:${c.phone}" class="btn-contact-fallback call-fallback" title="Tap to call this contact directly">📞 Direct Call</a>
+          <a href="sms:${c.phone}?body=${smsText}" class="btn-contact-fallback sms-fallback" title="Send direct SMS to this contact">💬 Direct SMS</a>
         </div>
       </div>
     `;
@@ -567,26 +575,12 @@ function showSosStatusToast(msg) {
   }, 6000);
 }
 
-// Wire SOS Trigger Buttons (Universal Failproof Dispatcher)
-const triggerSosImmediately = (sourceName) => {
-  console.log(`🚨 ${sourceName} Triggered -> Dispatching n8n & Twilio Calls Immediately`);
-  emergencySos.executeSosNow(sourceName);
-  cloudAlertDispatcher.dispatchEmergencyAlert({
-    sessionId: 'instant_' + Date.now(),
-    location: emergencySos.currentLocation,
-    contacts: emergencySos.contacts,
-    timestamp: new Date().toLocaleTimeString(),
-    liveTrackingUrl: 'https://saferoute-tawny.vercel.app/',
-    userPhone: '+916300863028'
-  });
-};
-
-// Universal delegated click listener for SOS buttons
+// Universal delegated click listener for SOS buttons (routes to 3-second cancelable countdown)
 document.addEventListener('click', (e) => {
-  const target = e.target.closest('#btnSidebarSos, .btn-emergency-sos-sm, .sos-menu-btn');
+  const target = e.target.closest('#btnSidebarSos, #btnHeaderGlobalSos, .btn-emergency-sos-sm, .sos-menu-btn');
   if (target) {
     e.preventDefault();
-    triggerSosImmediately(target.id || target.textContent.trim() || 'Global SOS Click');
+    emergencySos.startSosCountdown(target.id || target.textContent.trim() || 'Global SOS Click');
   }
 });
 

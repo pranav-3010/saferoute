@@ -2481,6 +2481,43 @@ body {
   transition: all 0.15s ease;
 }
 
+.contact-fallback-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.btn-contact-fallback {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-decoration: none;
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+
+.btn-contact-fallback.call-fallback {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.btn-contact-fallback.sms-fallback {
+  background: rgba(2, 132, 199, 0.15);
+  color: #0284c7;
+  border: 1px solid rgba(2, 132, 199, 0.3);
+}
+
+.dispatch-error-notice {
+  font-size: 10px;
+  color: #ef4444;
+  margin-top: 2px;
+  font-weight: 600;
+}
+
 .btn-contact-call:hover {
   background: var(--danger-color);
   color: #ffffff;
