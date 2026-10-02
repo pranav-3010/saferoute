@@ -55,61 +55,31 @@ export function decodeGooglePolyline(encoded) {
   return points;
 }
 
-/**
- * Detects whether a route enters a dead-end, private residential compound,
- * or cul-de-sac and doubles back out onto the same road junction.
- */
-function hasDeadEndLoop(path) {
-  if (!path || path.length < 8) return false;
-  const step = 2;
-  for (let i = 0; i < path.length - 6; i += step) {
-    const p1 = path[i];
-    for (let j = i + 5; j < Math.min(i + 35, path.length); j += step) {
-      const p2 = path[j];
-      const directMeters = haversineDistance(p1.lat, p1.lng, p2.lat, p2.lng) * 1000;
-      // If the direct distance between entry and exit is small (< 50m) but the vehicle traveled > 150m between them,
-      // the route entered an internal dead-end / gated complex and doubled back out!
-      if (directMeters < 50) {
-        let pathMeters = 0;
-        for (let k = i; k < j; k++) {
-          pathMeters += haversineDistance(path[k].lat, path[k].lng, path[k + 1].lat, path[k + 1].lng) * 1000;
-        }
-        if (pathMeters > 150) {
-          return true;
-        }
+// Detects a "hook": path leaves a point, wanders >minOutM away, then returns within closeM of it
+function hasSpur(path, minOutM = 60, closeM = 25) {
+  if (!path || path.length < 10) return false;
+  const pts = path.filter((_, i) => i % 3 === 0);
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 6; j < Math.min(pts.length, i + 60); j++) {
+      const back = haversineDistance(pts[i].lat, pts[i].lng, pts[j].lat, pts[j].lng) * 1000;
+      if (back > closeM) continue;
+      let far = 0;
+      for (let k = i + 1; k < j; k++) {
+        far = Math.max(far, haversineDistance(pts[i].lat, pts[i].lng, pts[k].lat, pts[k].lng) * 1000);
       }
+      if (far > minOutM) return true;
     }
   }
   return false;
 }
 
 /**
- * Deduplicates routes and discards dead-end loops or excessively long detours
+ * Deduplicates routes that are effectively the same road path (>95% overlap)
  */
 function deduplicateRoutes(routes) {
-  if (!routes || routes.length === 0) return [];
-
-  // Filter out any route that performs unnatural dead-end loops into gated compounds or gardens
-  const validRoutes = routes.filter(r => {
-    if (!r.path || r.path.length < 2) return false;
-    if (hasDeadEndLoop(r.path)) {
-      return false;
-    }
-    return true;
-  });
-
-  const baseRoutes = validRoutes.length > 0 ? validRoutes : routes;
-  const shortestKm = Math.min(...baseRoutes.map(r => r.distanceKm || 999));
-
   const unique = [];
-  for (const r of baseRoutes) {
+  for (const r of routes) {
     if (!r.path || r.path.length < 2) continue;
-
-    // Discard detours that are more than 1.4x the shortest route
-    if (shortestKm > 0 && r.distanceKm > shortestKm * 1.4) {
-      continue;
-    }
-
     const isDuplicate = unique.some(existing => {
       const distDiff = Math.abs(existing.distanceKm - r.distanceKm);
       const durDiff = Math.abs(existing.durationMin - r.durationMin);
@@ -266,14 +236,14 @@ export class SafeRouteEngine {
 
   /**
    * Queries real road network from OSRM driving/foot engine for a set of coordinate waypoints.
-   * Uses alternatives=3 for direct routes to fetch natural arterial road paths.
+   * Uses snapRadiusM to refuse snapping to roads far from the waypoint.
    */
-  async queryRealRoadPath(waypoints, allowAlternatives = true) {
+  async queryRealRoadPath(waypoints, snapRadiusM = null) {
     if (!waypoints || waypoints.length < 2) return null;
     const coordStr = waypoints.map(w => `${w.lng},${w.lat}`).join(';');
     const profile = this.getRoutingProfile();
-    const altParam = (allowAlternatives && waypoints.length === 2) ? 'alternatives=3' : 'alternatives=false';
-    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${coordStr}?overview=full&geometries=geojson&${altParam}`;
+    const radiuses = snapRadiusM ? `&radiuses=${waypoints.map(() => snapRadiusM).join(';')}` : '';
+    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${coordStr}?overview=full&geometries=geojson&alternatives=true${radiuses}`;
     
     try {
       const res = await fetch(osrmUrl, { signal: AbortSignal.timeout(6000) });
@@ -336,8 +306,8 @@ export class SafeRouteEngine {
       }
     }
 
-    // 2. Fetch direct authoritative OSRM driving routes with up to 3 alternatives
-    const directResults = await this.queryRealRoadPath([o, d], true);
+    // 2. Fetch direct authoritative OSRM driving routes with alternatives=true
+    const directResults = await this.queryRealRoadPath([o, d]);
     if (directResults && directResults.length > 0) {
       directResults.forEach((r, idx) => {
         rawCandidates.push({
@@ -352,8 +322,8 @@ export class SafeRouteEngine {
     }
 
     // 3. DYNAMIC SAFE DETOUR DISCOVERY:
-    // Only search for manual bypasses if we have fewer than 2 genuine corridors or an active High/Critical danger hotspot.
-    // Detour waypoints are strictly snapped to recognized public roads to avoid entering apartments or private gardens.
+    // Check if any reported unsafe hotspots lie near the direct paths.
+    // If so, explore genuine road network detours through legitimate arterial bypass waypoints.
     const allReports = reportStore.getAllReports();
     const midLat = (o.lat + d.lat) / 2;
     const midLng = (o.lng + d.lng) / 2;
@@ -361,61 +331,64 @@ export class SafeRouteEngine {
 
     const hasDangerHotspot = allReports.some(rep => {
       const dMid = haversineDistance(midLat, midLng, rep.latitude, rep.longitude);
-      return dMid <= (directDistKm * 0.5) && (rep.severity === 'Critical' || rep.severity === 'High');
+      return dMid <= (directDistKm * 0.6);
     });
 
-    if (rawCandidates.length < 2 || hasDangerHotspot) {
+    if (rawCandidates.length < 3 || hasDangerHotspot) {
       const dLat = d.lat - o.lat;
       const dLng = d.lng - o.lng;
       const mag = Math.sqrt(dLat * dLat + dLng * dLng) || 1;
       const perpLat = -dLng / mag;
       const perpLng = dLat / mag;
-      const offsetScale = Math.max(0.015, Math.min(0.04, directDistKm * 0.0035));
 
-      const rawA = {
+      // Sideways push = ~15% of trip length, clamped to 0.4–2 km (converted to degrees)
+      const offsetKm = Math.max(0.4, Math.min(2.0, directDistKm * 0.15));
+      const offsetScale = offsetKm / 111;
+
+      const bypassPointA = {
         lat: Number((midLat + perpLat * offsetScale).toFixed(6)),
         lng: Number((midLng + perpLng * offsetScale).toFixed(6))
       };
-      const rawB = {
+      const bypassPointB = {
         lat: Number((midLat - perpLat * offsetScale).toFixed(6)),
         lng: Number((midLng - perpLng * offsetScale).toFixed(6))
       };
 
-      const [snappedA, snappedB] = await Promise.all([
-        this.snapToNearestRoad(rawA.lat, rawA.lng),
-        this.snapToNearestRoad(rawB.lat, rawB.lng)
-      ]);
-
-      if (snappedA) {
-        const detourPathsA = await this.queryRealRoadPath([o, snappedA, d], false);
-        if (detourPathsA && detourPathsA[0] && detourPathsA[0].path.length > 2 && !hasDeadEndLoop(detourPathsA[0].path)) {
-          rawCandidates.push({
-            id: `osrm_detour_a`,
-            name: `Bypass via ${snappedA.name}`,
-            distanceKm: detourPathsA[0].distanceKm,
-            durationMin: detourPathsA[0].durationMin,
-            path: detourPathsA[0].path,
-            provider: "OSRM Real Road Network (Detour Corridor)"
-          });
-        }
+      const detourPathsA = await this.queryRealRoadPath([o, bypassPointA, d], 150);
+      if (detourPathsA && detourPathsA[0] && detourPathsA[0].path.length > 2) {
+        rawCandidates.push({
+          id: `osrm_detour_a`,
+          name: "Safe Arterial Bypass Corridor",
+          distanceKm: detourPathsA[0].distanceKm,
+          durationMin: detourPathsA[0].durationMin,
+          path: detourPathsA[0].path,
+          provider: "OSRM Real Road Network (Detour Corridor)"
+        });
       }
 
-      if (snappedB) {
-        const detourPathsB = await this.queryRealRoadPath([o, snappedB, d], false);
-        if (detourPathsB && detourPathsB[0] && detourPathsB[0].path.length > 2 && !hasDeadEndLoop(detourPathsB[0].path)) {
-          rawCandidates.push({
-            id: `osrm_detour_b`,
-            name: `Bypass via ${snappedB.name}`,
-            distanceKm: detourPathsB[0].distanceKm,
-            durationMin: detourPathsB[0].durationMin,
-            path: detourPathsB[0].path,
-            provider: "OSRM Real Road Network (Detour Corridor)"
-          });
-        }
+      const detourPathsB = await this.queryRealRoadPath([o, bypassPointB, d], 150);
+      if (detourPathsB && detourPathsB[0] && detourPathsB[0].path.length > 2) {
+        rawCandidates.push({
+          id: `osrm_detour_b`,
+          name: "Commercial Ring Road Bypass",
+          distanceKm: detourPathsB[0].distanceKm,
+          durationMin: detourPathsB[0].durationMin,
+          path: detourPathsB[0].path,
+          provider: "OSRM Real Road Network (Detour Corridor)"
+        });
       }
     }
 
-    return deduplicateRoutes(rawCandidates);
+    // Filter detours before deduplicateRoutes: reject spurs and over-long detours
+    const shortestKm = Math.min(...rawCandidates.map(r => r.distanceKm));
+    const filtered = rawCandidates.filter(r => {
+      if (!r.id.includes('detour')) return true;          // only police the generated detours
+      if (r.distanceKm > shortestKm * 1.35) return false;   // too long
+      if (hasSpur(r.path)) return false;                   // apartment/garden hook
+      return true;
+    });
+
+    return deduplicateRoutes(filtered);
   }
 
   /**
@@ -469,9 +442,11 @@ export class SafeRouteEngine {
       // Step 2: Run Multi-Factor Weighted Safety Scoring on Each Authentic Candidate Route
       const evaluatedRoutes = candidatePaths.map(cand => this.evaluateRouteSafety(cand));
 
-      // Step 3: Rank strictly by Safety Score (Highest to Lowest)
-      // Safety is preferred over shortest distance!
-      const sortedBySafety = [...evaluatedRoutes].sort((a, b) => b.safetyScore - a.safetyScore);
+      // Step 3: Penalize distance when ranking
+      // A route 25% longer loses 10 points in ranking. Displayed safety scores stay unchanged.
+      const shortest = Math.min(...evaluatedRoutes.map(r => r.distanceKm));
+      const rank = r => r.safetyScore - Math.max(0, (r.distanceKm / shortest - 1) * 40);
+      const sortedBySafety = [...evaluatedRoutes].sort((a, b) => rank(b) - rank(a));
 
       // Check shortest distance among routes to determine if safer route is longer
       const shortestCandidate = [...evaluatedRoutes].sort((a, b) => a.distanceKm - b.distanceKm)[0];
